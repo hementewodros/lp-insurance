@@ -7,46 +7,61 @@ import "../src/InsuranceVault.sol";
 import "../src/CoverageManager.sol";
 import "../src/LiquidityInsuranceHook.sol";
 
+contract MockPoolManager {
+    mapping(bytes32 => uint160) public sqrtPrices;
+    
+    function setSlot0(bytes32 poolId, uint160 sqrtPriceX96) external {
+        sqrtPrices[poolId] = sqrtPriceX96;
+    }
+    
+    function getSlot0(bytes32 poolId) external view returns (
+        uint160 sqrtPriceX96,
+        int24 tick,
+        uint16 observationIndex,
+        uint16 observationCardinality
+    ) {
+        return (sqrtPrices[poolId], 0, 0, 0);
+    }
+}
+
 contract LiquidityInsuranceTest is Test {
     ILCalculator public calculator;
     InsuranceVault public vault;
     CoverageManager public coverageManager;
     LiquidityInsuranceHook public hook;
+    MockPoolManager public poolManager;
 
     address public user = address(0x123);
     address public owner = address(0x456);
 
+    function sqrt(uint256 x) internal pure returns (uint256 y) {
+        if (x == 0) return 0;
+        uint256 z = (x + 1) / 2;
+        y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+    }
+
+    function priceToSqrtPriceX96(uint256 price) internal pure returns (uint160) {
+        uint256 value = (price * (2**112)) / 1e18;
+        return uint160(sqrt(value) * (2**40));
+    }
+
     function setUp() public {
         vm.startPrank(owner);
         calculator = new ILCalculator();
+        poolManager = new MockPoolManager();
         
-        // Note: Vault needs coverage manager address but we don't have it yet,
-        // so we use a dummy then create coverage manager, then deploy hook
-        // Actually, the constructor for Vault in liquishield takes (address _coverageManager)
-        // Let's deploy CoverageManager first without vault, but wait, CoverageManager takes (_calculator, _vault)
-        // We can just deploy them and assume they can call each other
+        coverageManager = new CoverageManager(address(calculator), address(poolManager));
+        vault = new InsuranceVault(address(coverageManager));
         
-        // Wait, CoverageManager in liquishield takes `(address _calculator, address payable _vault)`.
-        // Let's modify Vault constructor if needed, or just pass address(0) for coverageManager to vault
-        vault = new InsuranceVault(address(0));
+        coverageManager.setVault(payable(address(vault)));
         
-        coverageManager = new CoverageManager(address(calculator), payable(address(vault)));
-        
-        // Update vault's coverage manager (we can't natively unless we add a setter, but let's just cheat with prank or we changed `payClaim` to allow msg.sender == address(coverageManager) directly using the stored coverageManager... Wait, in InsuranceVault: `require(msg.sender == address(coverageManager) || msg.sender == owner)`. We are owner, so we can't change coverageManager. Wait, `owner` deployed it, so `owner` can call payClaim, but `coverageManager` needs to call it. Since `vault.coverageManager` is `address(0)`, it won't allow `coverageManager`.
-        // Let's just create them in right order if we can... wait, circular dependency.
-        
-        // It's okay, I'll update Vault to allow CoverageManager, or I will use `vm.mockCall`.
-        vm.stopPrank();
+        hook = new LiquidityInsuranceHook(address(coverageManager), address(vault), address(poolManager));
+        coverageManager.setHook(address(hook));
 
-        // Let's re-deploy them correctly
-        vm.startPrank(owner);
-        vault = new InsuranceVault(address(0));
-        coverageManager = new CoverageManager(address(calculator), payable(address(vault)));
-        // We can just use `vm.store` to set vault's coverageManager to the actual address
-        vm.store(address(vault), bytes32(uint256(0)), bytes32(uint256(uint160(address(coverageManager)))));
-
-        hook = new LiquidityInsuranceHook(address(coverageManager), address(vault));
-        
         // fund vault with ETH
         vm.deal(address(vault), 10 ether);
         vm.stopPrank();
@@ -55,8 +70,7 @@ contract LiquidityInsuranceTest is Test {
     }
 
     function testHookClaimFlow() public {
-        vm.startPrank(user);
-
+        // Prepare Pool and Position Keys
         PoolKey memory key = PoolKey({
             currency0: address(0),
             currency1: address(0),
@@ -65,45 +79,62 @@ contract LiquidityInsuranceTest is Test {
             hooks: address(hook)
         });
 
+        bytes32 poolId = keccak256(abi.encode(key));
+
         IPoolManager.ModifyLiquidityParams memory params = IPoolManager.ModifyLiquidityParams({
             tickLower: -100,
             tickUpper: 100,
-            liquidityDelta: 1 ether,
+            liquidityDelta: 1 ether, // liquidity amount
             salt: bytes32(0)
         });
 
-        // 1. User adds liquidity + buys insurance
-        bytes memory hookData = abi.encode(true); // optInInsurance = true
+        bytes32 positionId = keccak256(abi.encodePacked(user, params.tickLower, params.tickUpper, uint256(1 ether)));
+
+        // Set initial slot0 price of pool to 1000 ETH/USDC
+        poolManager.setSlot0(poolId, priceToSqrtPriceX96(1000e18));
+
+        vm.startPrank(user);
+
+        // 1. User adds liquidity with optInInsurance = true, paying premium (say 0.1 ether)
+        bytes memory hookData = abi.encode(true);
         hook.beforeAddLiquidity(user, key, params, hookData);
         
-        // Assume user pays premium via CoverageManager
-        uint256 premium = 0.1 ether;
-        coverageManager.buyCoverage{value: premium}(1 ether, 1000e18);
+        // Simulating the afterAddLiquidity called by poolManager with premium sent as msg.value
+        hook.afterAddLiquidity{value: 0.1 ether}(user, key, params, 1 ether, 1000e18, hookData);
 
-        hook.afterAddLiquidity(user, key, params, 1 ether, 1000e18, hookData);
+        // Check policy was registered correctly in CoverageManager
+        (address policyUser, bytes32 policyPoolId, uint256 liquidityAmount, uint256 initialPrice, uint256 coverageAmount, bool isActive) = coverageManager.policies(positionId);
+        assertEq(policyUser, user);
+        assertEq(policyPoolId, poolId);
+        assertEq(liquidityAmount, 1 ether);
+        assertApproxEqAbs(initialPrice, 1000e18, 1e11);
+        assertEq(coverageAmount, 1 ether); // 10x premium of 0.1 ether
+        assertTrue(isActive);
 
-        // 2. Simulate price decrease
-        uint256 currentPrice = 500e18;
-        
-        // 3. Calculate IL > 5%
-        uint256 ilAmount = calculator.calculateIL(1000e18, currentPrice, 1 ether);
-        uint256 ilPercentage = (ilAmount * 10000) / 1 ether;
-        assertTrue(ilPercentage > 500, "IL should be > 5%");
+        // 2. Simulate price movement to trigger IL
+        // If price changes to 500 (halved), the IL is 5.71% (571 bps), which exceeds IL_THRESHOLD of 500 bps (5%)
+        poolManager.setSlot0(poolId, priceToSqrtPriceX96(500e18));
+
+        // 3. Verify IL is > 5% via CoverageManager
+        uint256 ilBps = coverageManager.getIL(positionId);
+        assertEq(ilBps, 571); // 5.71%
 
         uint256 balanceBefore = user.balance;
 
         // 4. Trigger claim
-        // In the hook it would be triggered in beforeRemoveLiquidity, but since we updated CoverageManager to have `claim(currentPrice)`, let's call that, or mock the hook calling it.
-        coverageManager.claim(currentPrice);
+        coverageManager.claim(positionId);
 
         // 5. Verify payout from InsuranceVault
         uint256 balanceAfter = user.balance;
         uint256 payout = balanceAfter - balanceBefore;
         assertTrue(payout > 0, "Should receive payout");
+        
+        // Payout should be exactly 0.0571 ether
+        assertEq(payout, 0.0571 ether);
 
         // 6. Ensure double-claim is not possible
         vm.expectRevert("No active policy");
-        coverageManager.claim(currentPrice);
+        coverageManager.claim(positionId);
 
         vm.stopPrank();
     }

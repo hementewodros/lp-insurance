@@ -2,36 +2,49 @@
 pragma solidity ^0.8.19;
 
 contract ILCalculator {
+    function sqrt(uint256 x) internal pure returns (uint256 y) {
+        if (x == 0) return 0;
+        uint256 z = (x + 1) / 2;
+        y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+    }
+
     /**
-     * @notice Calculates a simplified impermanent loss percentage for demonstration
-     * @param initialPrice The starting price
-     * @param currentPrice The current price
-     * @param liquidityAmount The amount of liquidity
-     * @return IL percentage
+     * @notice Calculates real ratio-based impermanent loss in basis points (10000 = 100%)
+     * @param initialPrice The starting price (18 decimals)
+     * @param currentPrice The current price (18 decimals)
+     * @return IL in basis points
      */
     function calculateIL(
         uint256 initialPrice,
-        uint256 currentPrice,
-        uint256 liquidityAmount
+        uint256 currentPrice
     ) external pure returns (uint256) {
-        if (initialPrice == 0 || liquidityAmount == 0) {
+        if (initialPrice == 0 || currentPrice == 0) {
+            return 0;
+        }
+        if (initialPrice == currentPrice) {
             return 0;
         }
 
-        // Simplified hold value and current value computation
-        uint256 holdValue = liquidityAmount * initialPrice;
-        uint256 currentValue = liquidityAmount * currentPrice;
+        // r = currentPrice / initialPrice. Scale by 1e18 for precision.
+        uint256 r = (currentPrice * 1e18) / initialPrice;
+        
+        // sqrt(r)
+        uint256 sqrtR = sqrt(r * 1e18); // since r is scaled by 1e18, r * 1e18 is scaled by 1e36, so sqrt is scaled by 1e18.
 
-        if (holdValue == currentValue) {
+        // IL ratio = 1 - (2 * sqrtR) / (1e18 + r)
+        uint256 term = (2 * sqrtR * 1e18) / (1e18 + r);
+        
+        if (term >= 1e18) {
             return 0;
         }
 
-        // Calculate absolute difference for the formula: IL = |currentValue - holdValue| / holdValue
-        uint256 diff = holdValue > currentValue 
-            ? holdValue - currentValue 
-            : currentValue - holdValue;
+        uint256 ilFraction = 1e18 - term; // Out of 1e18
 
-        // Return as a percentage
-        return (diff * 100) / holdValue;
+        // Convert to basis points: 1e18 corresponds to 10000 bps. So divide by 1e14.
+        return ilFraction / 1e14;
     }
 }

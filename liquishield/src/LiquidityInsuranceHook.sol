@@ -4,22 +4,6 @@ pragma solidity ^0.8.19;
 import "./CoverageManager.sol";
 import "./InsuranceVault.sol";
 
-// Mock interfaces for v4-core to make it compile if needed, 
-// or assuming v4-periphery BaseHook. For hackathon, keeping it minimal.
-interface IPoolManager {
-    struct ModifyLiquidityParams {
-        int24 tickLower;
-        int24 tickUpper;
-        int256 liquidityDelta;
-        bytes32 salt;
-    }
-    struct SwapParams {
-        bool zeroForOne;
-        int256 amountSpecified;
-        uint160 sqrtPriceLimitX96;
-    }
-}
-
 struct PoolKey {
     address currency0;
     address currency1;
@@ -31,50 +15,34 @@ struct PoolKey {
 contract LiquidityInsuranceHook {
     CoverageManager public coverageManager;
     InsuranceVault public vault;
+    IPoolManager public poolManager;
 
     struct LPPosition {
         uint256 liquidityAmount;
         uint256 entryPrice;
+        bytes32 poolId;
         bool hasInsurance;
     }
 
-    // Simplified mapping: user address -> LP Position
-    mapping(address => LPPosition) public lpPositions;
+    mapping(bytes32 => LPPosition) public lpPositions;
 
-    uint256 public constant PREMIUM = 0.01 ether;
-
-    constructor(address _coverageManager, address _vault) {
+    constructor(address _coverageManager, address _vault, address _poolManager) {
         coverageManager = CoverageManager(_coverageManager);
         vault = InsuranceVault(payable(_vault));
+        poolManager = IPoolManager(_poolManager);
     }
 
-    // Hook responsibilities
-    
-    // beforeAddLiquidity → register position
+    // beforeAddLiquidity
     function beforeAddLiquidity(
         address sender,
         PoolKey calldata key,
         IPoolManager.ModifyLiquidityParams calldata params,
         bytes calldata hookData
     ) external returns (bytes4) {
-        // Decode hook data to check if user opted in for insurance
-        bool optInInsurance = false;
-        if (hookData.length > 0) {
-            optInInsurance = abi.decode(hookData, (bool));
-        }
-
-        uint256 amount = uint256(params.liquidityDelta > 0 ? params.liquidityDelta : -params.liquidityDelta);
-
-        lpPositions[sender] = LPPosition({
-            liquidityAmount: amount,
-            entryPrice: 0, // Will be set in afterAddLiquidity
-            hasInsurance: optInInsurance
-        });
-
         return this.beforeAddLiquidity.selector;
     }
 
-    // afterAddLiquidity → store entry price
+    // afterAddLiquidity
     function afterAddLiquidity(
         address sender,
         PoolKey calldata key,
@@ -82,20 +50,45 @@ contract LiquidityInsuranceHook {
         int256 delta0,
         int256 delta1,
         bytes calldata hookData
-    ) external returns (bytes4) {
-        // Simplified entry price as ratio of tokens (mock implementation)
-        uint256 currentPrice = (uint256(delta1) * 1e18) / (uint256(delta0) == 0 ? 1 : uint256(delta0));
-        
-        LPPosition storage pos = lpPositions[sender];
-        if (pos.hasInsurance && pos.liquidityAmount > 0) {
-            pos.entryPrice = currentPrice;
-            // Optionally interact with CoverageManager here or assume premium is paid via router
+    ) external payable returns (bytes4) {
+        bool optInInsurance = false;
+        if (hookData.length > 0) {
+            optInInsurance = abi.decode(hookData, (bool));
+        }
+
+        if (optInInsurance) {
+            uint256 amount = uint256(params.liquidityDelta > 0 ? params.liquidityDelta : -params.liquidityDelta);
+            bytes32 poolId = keccak256(abi.encode(key));
+            
+            // Fetch real Uniswap price safely without overflow
+            (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(poolId);
+            uint256 sqrtPrice = uint256(sqrtPriceX96);
+            uint256 scaled = (sqrtPrice * 1e9) >> 96;
+            uint256 entryPrice = scaled * scaled;
+            
+            bytes32 positionId = keccak256(abi.encodePacked(sender, params.tickLower, params.tickUpper, amount));
+
+            lpPositions[positionId] = LPPosition({
+                liquidityAmount: amount,
+                entryPrice: entryPrice,
+                poolId: poolId,
+                hasInsurance: true
+            });
+
+            // Create policy in CoverageManager. Forward the premium.
+            coverageManager.createPolicy{value: msg.value}(
+                sender,
+                positionId,
+                poolId,
+                amount,
+                entryPrice
+            );
         }
 
         return this.afterAddLiquidity.selector;
     }
 
-    // afterSwap → update price reference
+    // afterSwap
     function afterSwap(
         address sender,
         PoolKey calldata key,
@@ -104,41 +97,26 @@ contract LiquidityInsuranceHook {
         int256 delta1,
         bytes calldata hookData
     ) external returns (bytes4) {
-        // Price reference updated in system. In a real hook, we might use the pool's slot0.
-        // For hackathon, we could just evaluate IL here if needed or just store the last price.
-        // The prompt says "afterSwap -> update price reference"
-        uint256 currentPrice = 1e18; // Mock price
-        
         return this.afterSwap.selector;
     }
 
-    // beforeRemoveLiquidity → check IL + trigger claim logic
+    // beforeRemoveLiquidity
     function beforeRemoveLiquidity(
         address sender,
         PoolKey calldata key,
         IPoolManager.ModifyLiquidityParams calldata params,
         bytes calldata hookData
     ) external returns (bytes4) {
-        LPPosition memory pos = lpPositions[sender];
+        uint256 amount = uint256(params.liquidityDelta > 0 ? params.liquidityDelta : -params.liquidityDelta);
+        bytes32 positionId = keccak256(abi.encodePacked(sender, params.tickLower, params.tickUpper, amount));
+        
+        LPPosition memory pos = lpPositions[positionId];
         if (pos.hasInsurance) {
-            uint256 currentPrice = 1e18; // Mock price reference
-            
-            // Trigger IL evaluation and claim logic
-            uint256 ilPercentage = coverageManager.getIL(sender, currentPrice);
-
-            // If IL exceeds threshold, trigger a payout from the vault
-            if (ilPercentage > 5) {
-                // Trigger claim
-                // vault.claimProtection(currentPrice);
-            }
+            delete lpPositions[positionId];
         }
-
-        // Clean up position
-        delete lpPositions[sender];
 
         return this.beforeRemoveLiquidity.selector;
     }
 
-    // Allows users to pay premium directly to the hook
     receive() external payable {}
 }
