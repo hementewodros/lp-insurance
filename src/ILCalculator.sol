@@ -6,28 +6,32 @@ contract ILCalculator {
      * @notice Calculates a simplified impermanent loss percentage for demonstration
      * @param initialPrice The starting price
      * @param currentPrice The current price
-     * @param depositedAmount The amount of tokens deposited
-     * @return IL percentage (e.g., 5 represents 5%)
+     * @param liquidityAmount The amount of liquidity
+     * @return IL percentage
      */
     function calculateIL(
         uint256 initialPrice,
         uint256 currentPrice,
-        uint256 depositedAmount
+        uint256 liquidityAmount
     ) external pure returns (uint256) {
-        require(initialPrice > 0, "Initial price cannot be zero");
-        
-        if (currentPrice == initialPrice || depositedAmount == 0) {
+        if (initialPrice == 0 || liquidityAmount == 0) {
             return 0;
         }
 
-        uint256 priceDiff = currentPrice > initialPrice 
-            ? currentPrice - initialPrice 
-            : initialPrice - currentPrice;
+        // Simplified hold value and current value computation
+        uint256 holdValue = liquidityAmount * initialPrice;
+        uint256 currentValue = liquidityAmount * currentPrice;
 
-        // Simple mock IL math: Half of the percentage change in price
-        uint256 priceChangePercentage = (priceDiff * 100) / initialPrice;
-        uint256 ilPercentage = priceChangePercentage / 2;
+        if (holdValue == currentValue) {
+            return 0;
+        }
 
-        return ilPercentage;
+        // Calculate absolute difference for the formula: IL = |currentValue - holdValue| / holdValue
+        uint256 diff = holdValue > currentValue 
+            ? holdValue - currentValue 
+            : currentValue - holdValue;
+
+        // Return as a percentage
+        return (diff * 100) / holdValue;
     }
 }
